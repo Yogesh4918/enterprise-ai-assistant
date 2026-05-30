@@ -55,8 +55,8 @@ app.add_middleware(
 )
 
 # ── Rate Limiting Middleware ───────────────────────────────────────────
-from app.middleware.rate_limit import RateLimitMiddleware
-app.add_middleware(RateLimitMiddleware, max_requests=100, window_seconds=60)
+from app.middleware.rate_limit import setup_rate_limit
+setup_rate_limit(app, requests_per_minute=100, burst=30)
 
 # ── Import and include routers ─────────────────────────────────────────
 from app.api.auth import router as auth_router
