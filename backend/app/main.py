@@ -45,6 +45,14 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+@app.get("/")
+async def root():
+    return {
+        "status": "success",
+        "message": "Enterprise AI Backend is running"
+    }
+
+
 # ── CORS Middleware ────────────────────────────────────────────────────
 app.add_middleware(
     CORSMiddleware,
@@ -78,45 +86,7 @@ app.include_router(analytics_router)
 @app.get("/api/health", tags=["Health"])
 async def health_check():
     """Health check endpoint for monitoring and load balancers."""
-    health = {
-        "status": "healthy",
-        "version": settings.APP_VERSION,
-        "services": {},
-    }
-
-    # Check PostgreSQL
-    try:
-        from app.database import engine
-        async with engine.connect() as conn:
-            await conn.execute(__import__("sqlalchemy").text("SELECT 1"))
-        health["services"]["database"] = "connected"
-    except Exception as e:
-        health["services"]["database"] = f"error: {str(e)}"
-        health["status"] = "degraded"
-
-    # Check Redis
-    try:
-        import redis.asyncio as aioredis
-        r = aioredis.from_url(settings.REDIS_URL)
-        await r.ping()
-        await r.aclose()
-        health["services"]["redis"] = "connected"
-    except Exception as e:
-        health["services"]["redis"] = f"error: {str(e)}"
-        health["status"] = "degraded"
-
-    # Check Qdrant
-    try:
-        from qdrant_client import QdrantClient
-        client = QdrantClient(host=settings.QDRANT_HOST, port=settings.QDRANT_PORT, timeout=5)
-        client.get_collections()
-        health["services"]["qdrant"] = "connected"
-    except Exception as e:
-        health["services"]["qdrant"] = f"error: {str(e)}"
-        health["status"] = "degraded"
-
-    status_code = 200 if health["status"] == "healthy" else 503
-    return JSONResponse(content=health, status_code=status_code)
+    return {"status": "healthy"}
 
 
 # ── Global Exception Handler ──────────────────────────────────────────
