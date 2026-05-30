@@ -28,7 +28,7 @@ class MemoryMessage:
 
 
 class ConversationMemory:
-    """Redis-backed sliding-window conversation memory with auto-summarization."""
+    """Redis-backed sliding-window conversation memory with auto-summarization and in-memory fallback."""
 
     def __init__(self) -> None:
         settings = get_settings()
@@ -36,21 +36,36 @@ class ConversationMemory:
         self._redis_url = settings.REDIS_URL
         self._llm_model = settings.LLM_MODEL
         self._openai_key = settings.OPENAI_API_KEY
+        self._in_memory_history: dict[str, list[MemoryMessage]] = {}
+        self._in_memory_summaries: dict[str, str] = {}
+        self._use_in_memory = False
 
-    async def _get_redis(self) -> aioredis.Redis:
-        """Lazy-init the Redis connection."""
+    async def _get_redis(self) -> Optional[aioredis.Redis]:
+        """Lazy-init the Redis connection, falling back to in-memory if Redis is unavailable."""
+        if self._use_in_memory:
+            return None
+
         if self._redis is None:
-            self._redis = aioredis.from_url(
-                self._redis_url,
-                decode_responses=True,
-                socket_connect_timeout=5,
-            )
+            try:
+                self._redis = aioredis.from_url(
+                    self._redis_url,
+                    decode_responses=True,
+                    socket_connect_timeout=2,
+                )
+                await self._redis.ping()
+            except Exception as exc:
+                logger.warning("Redis connection failed. Falling back to in-memory storage: %s", exc)
+                self._use_in_memory = True
+                self._redis = None
         return self._redis
 
     async def close(self) -> None:
         """Close the Redis connection."""
         if self._redis is not None:
-            await self._redis.close()
+            try:
+                await self._redis.close()
+            except Exception:
+                pass
             self._redis = None
 
     async def add_message(
@@ -59,25 +74,23 @@ class ConversationMemory:
         role: str,
         content: str,
     ) -> None:
-        """Append a message to the conversation history.
-
-        Parameters
-        ----------
-        conversation_id : str
-            Unique conversation identifier.
-        role : str
-            One of 'user', 'assistant', 'system'.
-        content : str
-            The message text.
-        """
-        r = await self._get_redis()
-        key = f"{_HISTORY_PREFIX}{conversation_id}"
-
+        """Append a message to the conversation history."""
         msg = MemoryMessage(
             role=role,
             content=content,
             timestamp=datetime.now(timezone.utc).isoformat(),
         )
+
+        r = await self._get_redis()
+        if r is None:
+            if conversation_id not in self._in_memory_history:
+                self._in_memory_history[conversation_id] = []
+            self._in_memory_history[conversation_id].append(msg)
+            if len(self._in_memory_history[conversation_id]) > 30:
+                await self.summarize_if_needed(conversation_id)
+            return
+
+        key = f"{_HISTORY_PREFIX}{conversation_id}"
         await r.rpush(key, json.dumps(asdict(msg)))
         await r.expire(key, _TTL_SECONDS)
 
@@ -91,23 +104,13 @@ class ConversationMemory:
         conversation_id: str,
         limit: int = 20,
     ) -> List[MemoryMessage]:
-        """Retrieve recent conversation history.
-
-        Parameters
-        ----------
-        conversation_id : str
-            Unique conversation identifier.
-        limit : int
-            Maximum number of recent messages to return.
-
-        Returns
-        -------
-        list[MemoryMessage]
-            Most recent messages, ordered chronologically.
-        """
+        """Retrieve recent conversation history."""
         r = await self._get_redis()
-        key = f"{_HISTORY_PREFIX}{conversation_id}"
+        if r is None:
+            hist = self._in_memory_history.get(conversation_id, [])
+            return hist[-limit:]
 
+        key = f"{_HISTORY_PREFIX}{conversation_id}"
         raw_messages = await r.lrange(key, -limit, -1)
         messages: list[MemoryMessage] = []
         for raw in raw_messages:
@@ -152,30 +155,32 @@ class ConversationMemory:
         return "\n".join(parts) if parts else "No previous conversation."
 
     async def summarize_if_needed(self, conversation_id: str) -> None:
-        """Summarize older messages to keep context window manageable.
-
-        Keeps the most recent 10 messages and summarizes everything before
-        that into a running summary stored separately.
-        """
+        """Summarize older messages to keep context window manageable."""
         r = await self._get_redis()
-        key = f"{_HISTORY_PREFIX}{conversation_id}"
-        length = await r.llen(key)
-
-        if length <= 20:
-            return
-
-        keep_recent = 10
-        to_summarize_count = length - keep_recent
-
-        # Get the messages to summarize
-        raw_old = await r.lrange(key, 0, to_summarize_count - 1)
-        old_messages: list[str] = []
-        for raw in raw_old:
-            try:
-                data = json.loads(raw)
-                old_messages.append(f"{data['role']}: {data['content']}")
-            except (json.JSONDecodeError, TypeError):
-                continue
+        
+        if r is None:
+            hist = self._in_memory_history.get(conversation_id, [])
+            length = len(hist)
+            if length <= 20:
+                return
+            keep_recent = 10
+            to_summarize_count = length - keep_recent
+            old_messages = [f"{msg.role}: {msg.content}" for msg in hist[:to_summarize_count]]
+        else:
+            key = f"{_HISTORY_PREFIX}{conversation_id}"
+            length = await r.llen(key)
+            if length <= 20:
+                return
+            keep_recent = 10
+            to_summarize_count = length - keep_recent
+            raw_old = await r.lrange(key, 0, to_summarize_count - 1)
+            old_messages = []
+            for raw in raw_old:
+                try:
+                    data = json.loads(raw)
+                    old_messages.append(f"{data['role']}: {data['content']}")
+                except (json.JSONDecodeError, TypeError):
+                    continue
 
         if not old_messages:
             return
@@ -214,9 +219,14 @@ class ConversationMemory:
             return
 
         # Store summary and trim old messages
-        summary_key = f"{_SUMMARY_PREFIX}{conversation_id}"
-        await r.set(summary_key, summary, ex=_TTL_SECONDS)
-        await r.ltrim(key, to_summarize_count, -1)
+        if r is None:
+            self._in_memory_summaries[conversation_id] = summary
+            self._in_memory_history[conversation_id] = hist[to_summarize_count:]
+        else:
+            summary_key = f"{_SUMMARY_PREFIX}{conversation_id}"
+            key = f"{_HISTORY_PREFIX}{conversation_id}"
+            await r.set(summary_key, summary, ex=_TTL_SECONDS)
+            await r.ltrim(key, to_summarize_count, -1)
 
         logger.info(
             "Summarized %d messages for conversation %s",
@@ -227,12 +237,21 @@ class ConversationMemory:
     async def _get_summary(self, conversation_id: str) -> str:
         """Retrieve the stored conversation summary."""
         r = await self._get_redis()
+        if r is None:
+            return self._in_memory_summaries.get(conversation_id, "")
+
         summary_key = f"{_SUMMARY_PREFIX}{conversation_id}"
         return await r.get(summary_key) or ""
 
     async def clear(self, conversation_id: str) -> None:
         """Delete all history and summary for a conversation."""
         r = await self._get_redis()
+        if r is None:
+            self._in_memory_history.pop(conversation_id, None)
+            self._in_memory_summaries.pop(conversation_id, None)
+            logger.info("Cleared memory for conversation %s", conversation_id)
+            return
+
         await r.delete(
             f"{_HISTORY_PREFIX}{conversation_id}",
             f"{_SUMMARY_PREFIX}{conversation_id}",
