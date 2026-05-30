@@ -14,7 +14,7 @@ from app.config import get_settings
 from app.models.document import Document, DocumentStatus
 from app.rag.ingestion import DocumentLoader
 from app.rag.chunking import TextChunker
-from app.rag.embeddings import EmbeddingService
+from app.rag.embeddings import OpenAIEmbeddingService as EmbeddingService
 from app.rag.vectorstore import QdrantVectorStore
 
 logger = logging.getLogger(__name__)
